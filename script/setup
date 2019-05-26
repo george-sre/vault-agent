@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+#
+# Creates a Vault service and pod in Minikube and configures generic/PKI
+# backends needed by Vault Reactor.
+
+## Following files, for SCRIPT_DIR warnings
+# shellcheck disable=SC1090
+
+set -e
+
+shopt -s expand_aliases
+
+SCRIPT_DIR="$( cd "$( dirname "$0" )" && pwd )"
+
+source "${SCRIPT_DIR}/variables.sh"
+source "${SCRIPT_DIR}/functions.sh"
+
+echo "Checking that Minikube is installed and running"
+ensure_minikube_installed_and_running "$MINIKUBE_VERSION" "$BUILD_PLATFORM" "$KUBERNETES_VERSION"
+
+echo "Making sure Kubernetes is running"
+ensure_kubernetes_running
+
+echo "Deleting Vault service and pod in case they already exist"
+kubectl delete service vault --ignore-not-found=true --now
+kubectl delete pod vault --ignore-not-found=true --now
+ensure_pod_deleted vault
+
+echo "Creating Vault service and pod in Minikube"
+kubectl create -f - <<-EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: vault
+spec:
+  ports:
+  - port: 8200
+    protocol: TCP
+    targetPort: 8200
+  selector:
+    app: vault
+  type: NodePort
+
+---
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vault
+  labels:
+    app: vault
+spec:
+  containers:
+    - name: vault
+      image: "vault:${DEV_VAULT_VERSION}"
+      env:
+        - name: VAULT_DEV_ROOT_TOKEN_ID
+          value: $DEV_VAULT_TOKEN
+        - name: VAULT_ADDR
+          value: http://127.0.0.1:8200
+        - name: VAULT_TOKEN
+          value: $DEV_VAULT_TOKEN
+EOF
+
+ensure_pod_running vault
+
+echo "Making sure Vault service is available..."
+ensure_vault_service_available
+
+echo "Setting up vault for first time use..."
+
+## Agent uses the standard "secret/" kv store.
+## We'll want to create some keys, though
+
+#echo "Creating generic backend..."
+#run_vault mount -path=reactor -description "reactor legacy K/V" kv
+
+#echo "Creating pki backend..."
+#run_vault mount -path=pki -max-lease-ttl=87600h -description "georgesre.network Root CA" pki
+#run_vault write pki/root/generate/internal common_name=${DEV_VAULT_PKI_COMMON_NAME} ttl=87600h
+#run_vault write pki/roles/${DEV_VAULT_PKI_ROLE} allow_any_name=true allow_subdomains=true max_ttl=72h
+
+echo "Vault setup is complete"

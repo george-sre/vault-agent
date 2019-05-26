@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+#
+# Builds a Docker container using the current vault-agent code in the
+# repository and launches a Kubernetes pod in Minikube using the container.
+
+## Following files, for SCRIPT_DIR warnings
+# shellcheck disable=SC1090
+
+set -e
+
+SCRIPT_DIR="$( cd "$( dirname "$0" )" && pwd )"
+
+source "${SCRIPT_DIR}/variables.sh"
+source "${SCRIPT_DIR}/functions.sh"
+
+echo "Checking that Minikube is installed and running"
+ensure_minikube_installed_and_running "$MINIKUBE_VERSION" "$BUILD_PLATFORM" "$KUBERNETES_VERSION"
+
+echo "Making sure Kubernetes is running"
+ensure_kubernetes_running
+
+echo "Connecting to minikube docker daemon"
+eval "$(minikube docker-env)"
+
+TAG=$RANDOM
+
+echo "Building docker image vault-agent:$TAG"
+docker build -t vault-agent:"$TAG" "${SCRIPT_DIR}/.."
+
+echo "Deleting vault-agent pod in case it already exists"
+kubectl delete pod vault-agent --ignore-not-found=true --now
+ensure_pod_deleted vault-agent
+
+echo "Installing latest version of vault-agent in Minikube"
+kubectl apply -f - <<-EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vault-agent
+spec:
+  containers:
+    - name: vault-agent
+      image: vault-agent:$TAG
+      env:
+        - name: VAULT_TOKEN
+          value: $DEV_VAULT_TOKEN
+        - name: VAULT_ADDR
+          value: ${DEV_VAULT_ADDR}
+        - name: SECRET_REFRESH_TIME
+          value: "120"
+        - name: PROJECT
+          value: georgesre-test
+        - name: LOG_LEVEL
+          value: DEBUG
+EOF
+
+ensure_pod_running vault-agent
+
+echo "Showing logs for vault-agent pod..."
+kubectl logs vault-agent

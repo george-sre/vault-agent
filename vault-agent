@@ -1,0 +1,250 @@
+#!/usr/bin/env python
+
+import logging
+import os
+import sys
+import time
+
+import requests
+import yaml
+
+from kubernetes import client, config
+from kubernetes.client.rest import ApiException
+
+# Setup logging
+log = logging.getLogger(__name__)
+out_hdlr = logging.StreamHandler(sys.stdout)
+out_hdlr.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+out_hdlr.setLevel(logging.INFO)
+log.addHandler(out_hdlr)
+log.setLevel(logging.INFO)
+
+class VaultAgent:
+    def __init__(self):
+        # Get the project from env, or try metadata.
+        self.project_name = os.environ.get('PROJECT', self.get_cloud_metadata('project/project-id'))
+        self.refresh_time = int(os.environ.get('SECRET_REFRESH_TIME', 300))
+        self.vault_token = os.environ.get('VAULT_TOKEN')
+        self.vault_addr = os.environ.get('VAULT_ADDR')
+        self.local_kube_proxy = os.environ.get('LOCAL_KUBE_PROXY', False)
+
+        # TODO: This is very hacky, and subject to some whitespace issues.
+        self.ignore_namespaces = os.environ.get('IGNORE_NAMESPACES', 'kube-system,kube-public,default').split(",")
+        self.secret_name_suffix = os.environ.get('SECRET_NAME_SUFFIX', '.service-secrets')
+        self.app_config_map = os.environ.get('APP_CONFIG_MAP', 'vault-agent.app-config')
+        self.base_path = os.environ.get('SECRET_BASE_PATH', 'secret')
+        self.version = '0.0.0'
+        with open('VERSION', 'r') as v:
+            self.version = v.read().replace('\n', '')
+
+        self.log_level = os.environ.get('LOG_LEVEL', 'INFO')
+        if self.log_level in ('CRITICAL','ERROR','WARNING','INFO','DEBUG'):
+            # Trickery to convert string to numeric log level
+            log.setLevel(getattr(logging,self.log_level))
+        else:
+            print("Unsupported log level: %s" % self.log_level)
+            print("Supported levels are: CRITICAL, ERROR, WARNING, INFO, DEBUG")
+            sys.exit(1)
+
+        if self.local_kube_proxy:
+            client.configuration.host = self.local_kube_proxy
+        else:
+            config.load_incluster_config()
+
+        if os.environ.get("K8S_SKIP_TLS_VERIFY") == "true":
+            client.Configuration._default.verify_ssl = False
+
+    def get_cloud_metadata(self, key):
+        metadata_server = "http://metadata/computeMetadata/v1/"
+        metadata_flavor = {'Metadata-Flavor' : 'Google'}
+        try:
+            return requests.get(metadata_server + key, headers = metadata_flavor).text
+        except:
+            return None
+
+    def vault_request(self, method, resource, **args):
+        url = "{0}/{1}".format(self.vault_addr, resource)
+        headers = { 'X-Vault-Token': self.vault_token, 'Content-Type': 'application/json' }
+        response = requests.request(method, url, headers=headers, **args)
+
+        return response
+
+    def get_secrets(self, url):
+        secrets = {}
+        r = self.vault_request('LIST', url)
+        # It's normal to not find secrets, this is a sparse tree.
+        if r.status_code == 404:
+            return {}
+        # it's not normal to get other weird errors
+        if r.status_code != 200:
+            r.raise_for_status()
+        keys = r.json()['data']['keys']
+        for k in keys:
+            secret_url = '{0}/{1}'.format(url, k)
+            r = self.vault_request('GET', secret_url)
+            if r.status_code != 200:
+                r.raise_for_status()
+            value = r.json()['data']['value']
+            secrets[k] = value
+        return secrets
+
+    def list_secrets(self, url):
+        secrets = []
+        r = self.vault_request('LIST', url)
+        if r.status_code != 200:
+            r.raise_for_status()
+        keys = r.json()['data']['keys']
+        for k in keys:
+            secrets.append(k.strip("/"))
+        return secrets
+
+    def merge_dicts(self, *dict_args):
+        result = {}
+        for dictionary in dict_args:
+            result.update(dictionary)
+        return result
+
+    def get_vault(self, namespace, app_name):
+        service_default_url = 'v1/{0}/projects/{1}/services/{2}/defaults'.format(self.base_path, self.project_name, app_name)
+        service_url = 'v1/{0}/projects/{1}/services/{2}/namespaces/{3}'.format(self.base_path, self.project_name, app_name, namespace)
+
+        # Load data for any namespace
+        try:
+            service_default_secrets = self.get_secrets(service_default_url)
+        except Exception as err:
+            service_default_secrets = {}
+        if len(service_default_secrets) == 0:
+            log.debug('No default secrets found at path: "{0}"'.format(service_default_url))
+
+        # Load data from specific namespace
+        try:
+            service_secrets = self.get_secrets(service_url)
+        except Exception as err:
+            log.warn(err)
+            service_secrets = {}
+        if len(service_secrets) == 0:
+            log.debug('No namespaced secrets found at path: "{0}"'.format(service_url))
+
+        return self.merge_dicts(service_default_secrets, service_secrets)
+
+    def set_kube_secret(self, namespace, app, secrets):
+        name = "{0}{1}".format(app, self.secret_name_suffix)
+        exists = True
+        v1 = client.CoreV1Api()
+        metadata = {"name": name,
+                    "labels": { "app": app }}
+        body = client.V1Secret() # V1Secret |
+        body.metadata = metadata
+        body.string_data = secrets
+        log.info("Setting secret '%s' in '%s' namespace..." % (name, namespace))
+
+        # Try and patch first since most secrets will exist
+        try:
+            api_response = v1.patch_namespaced_secret(name, namespace, body, pretty=False)
+        except ApiException as e:
+            if e.status == 404:
+                log.debug("Secret '%s' doesn't exist." % name)
+                exists = False
+            else:
+                print("Exception when calling CoreV1Api->patch_namespaced_secret: %s\n" % e)
+
+        if not exists:
+            log.info("Creating secret: %s" % name)
+            try:
+                api_response = v1.create_namespaced_secret(namespace, body, pretty=False)
+                exists = True
+            except ApiException as e:
+                log.error("Exception when calling CoreV1Api->create_namespaced_secret: %s\n" % e)
+        return exists
+
+    def get_namespaces(self):
+        v1 = client.CoreV1Api()
+        nslist = v1.list_namespace(watch=False)
+        namespaces = []
+        for i in nslist.items:
+            if i.metadata.name not in self.ignore_namespaces:
+                namespaces.append(i.metadata.name)
+        log.debug("Found namespaces %s" % (','.join(namespaces)))
+        log.debug("Excluded namespaces %s" % (','.join(self.ignore_namespaces)))
+        return namespaces
+
+    def get_namespaced_apps(self, ns):
+        v1 = client.CoreV1Api()
+        log.debug("Retrieving config map %s for namespace %s" % (self.app_config_map,ns))
+        try:
+            cm = v1.read_namespaced_config_map(namespace=ns, name=self.app_config_map)
+        except ApiException as err:
+            if err.status == 404:
+                log.info("Defaulting lack of config map %s in namespace %s to ALL" % (self.app_config_map, ns))
+                apps = self.get_apps_from_vault()
+                return apps
+            else:
+                log.error("Exception when calling CoreV1Api->read_namespaced_config_map: %s\n" % err)
+                return []
+
+        try:
+            apps = yaml.load(cm.data["apps"])
+        except Exception as err:
+            log.error('Failed to unmarshal yaml from %s: %s' % (ns,err))
+            return []
+
+        # Check for bare word (like ALL), which could be a common problem.
+        # Convert it to list if so.  This needs trickery, because Python.
+        # Python 2/3 compat https://stackoverflow.com/a/26797718
+        if 'basestring' not in globals():
+            basestring = str
+        if isinstance(apps, basestring):
+            apps=[apps]
+
+        # last case, if we really specified we want ALL apps.
+        if "ALL" in apps:
+            log.debug("Expanding apps in namespace %s from ALL found in config map" % ns)
+            apps = self.get_apps_from_vault()
+
+        log.debug("Found apps for namespace %s: %s" % (ns,','.join(apps)))
+        return apps
+
+    def get_apps_from_vault(self):
+        services_url = 'v1/{0}/projects/{1}/services'.format(self.base_path, self.project_name)
+        try:
+            services = self.list_secrets(services_url)
+        except Exception as err:
+            log.error('Failed to list secrets in %s code %s' % (services_url,err))
+            services = []
+        log.debug("Found services at %s: %s" % (services_url,','.join(services)))
+
+        return services
+
+
+if __name__ == "__main__":
+
+    log.info('Initializing vault-agent...')
+    v = VaultAgent()
+
+    log.info('Vault address: %s' %  v.vault_addr)
+    log.info('Secret refresh time set to: %s' %  v.refresh_time)
+    log.info('Current project name is: %s' %  v.project_name)
+    log.info('Current version: %s' %  v.version)
+    try:
+        os.environ['REQUESTS_CA_BUNDLE']
+    except Exception as err:
+        log.error('REQUESTS_CA_BUNDLE env variable is not set, should be set to os default path.')
+        raise
+
+    while True:
+        log.info('vault-agent is running...')
+
+        # get all the namespaces, with exclude logic
+        nslist = v.get_namespaces()
+        for ns in sorted(nslist):
+
+            # fill the apps array with crazy logic
+            applist = v.get_namespaced_apps(ns)
+
+            for app in sorted(applist):
+                # for each app in this namespace
+                secrets = v.get_vault(ns, app)
+                if bool(secrets):
+                    v.set_kube_secret(ns, app, secrets)
+
+        time.sleep(v.refresh_time)
